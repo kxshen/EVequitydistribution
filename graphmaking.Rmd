@@ -1,0 +1,189 @@
+---
+title: "Methodology for EV registrations by income"
+output: html_notebook
+---
+
+This is a quick documentation behind the graph in the blog post exercise, hosted via Github Pages!
+
+The dataset used comes from https://theicct.org/publications/EV-equity-feb2021, which in a brief paragraph on page 3 used the Atlas EV Hub data to do a crude analysis of adoption for different models by ZIP code income level. Though the data is incomplete, and has inconsistent format and years, it is the most geographically granular dataset that I could find. Individual level data is even more hard to find. The dataset seems good enough for a well-caveated general estimation, much better than generalizing from a single state. 
+
+States such as California and Massachusetts offer data portals for their rebate programs, but these are uncomparable with more broadly available registrations data. 
+
+IHS Markit seems to provide a more comprehensive view of vehicle sales/registrations, but is not openly available. A more robust iteration of the graphic would use this data source. 
+
+```{r message=FALSE, warning=FALSE}
+#Libraries for use
+library(tidyverse) #tidyverse for neat data processing
+library(tidycensus)
+#census_api_key("INSERT_CENSUS_API_KEY", overwrite = TRUE, install = TRUE)
+#Sys.getenv("CENSUS_API_KEY") #check key
+library(zipcodeR)
+library(reshape2)
+```
+
+The first step would be to download all of the ZIP code level data files from the Atlas EV Hub website https://www.atlasevhub.com/materials/state-ev-registration-data/. I omitted states with only county level data, as that is too coarse to gauge equity impacts without much more comprehensive data. Time periods of each state's dataset can be found on the website too. 
+
+I also added in Maryland data from their Open Data Portal, since I happen to live there and found it during my search https://opendata.maryland.gov/Transportation/MD-MDOT-MVA-Electric-and-Plug-in-Hybrid-Vehicle-Re/tugr-unu9. 
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+#First set working directory to folder with all registrations data
+# setwd("~/.../.../.../...")
+state_abbrevs = c("co", "ct", "mi", "mn", "nj", "ny", "or", "tx", "vt", "wa", "wi") 
+filenames = paste0(state_abbrevs, "_ev_registrations_public.csv")
+snapshots = c("CO DMV Direct (4/1/2021)", "DMV Direct (1/4/2018)", "DMV Direct (1/27/2020)", "DMV Direct (2/1/2020)", "MVC Direct (12/31/2020)", "NY DATA.NY.GOV (4/1/2021)", "DMV Direct (12/31/2020)", "Registration Data from DFW Clean Cities (4/6/2021)", "DMV Direct (6/26/2020)", "WA DMV Direct (3/15/2021)", "DMV Direct (12/31/2020)") #select snapshots manually to avoid double counting
+
+#download VIN decoder from Atlas EV Hub to join models to classifications of BEV, PHEV, and FCEV. Convert to CSV in Excel to not download xlsx R package
+VINdecoder = read_csv("VIN_decoder.csv")
+VINdecoder = VINdecoder %>% select(`VIN Prefix`, `VIN Model Year`, Technology, `Vehicle Name`)
+
+#create master dataframe for counts by technology for each ZIP code, using MD for formatting
+EV_regs_zip = read_csv("md_ev_registrations_public.csv")
+EV_regs_zip = EV_regs_zip %>% 
+  filter(Year_Month == "2021/03") %>%
+  rename(Technology = Fuel_Category) %>%
+  select(-Year_Month)
+EV_regs_zip$Technology[EV_regs_zip$Technology == "Electric"] = "BEV"
+EV_regs_zip$Technology[EV_regs_zip$Technology == "Plug-In Hybrid"] = "PHEV"
+
+for(file in filenames){
+  df <- read_csv(file)
+  
+  #select one DMV snapshot
+  if(any(names(df) == "DMV Snapshot (Date)")){
+    df <- df %>% rename(`DMV Snapshot` = `DMV Snapshot (Date)`)
+  }
+  df <- df %>% filter(`DMV Snapshot` == snapshots[which(filenames == file)])
+  
+  if(file == "tx_ev_registrations_public.csv"){ #process TX and WA manually due to inconsistencies
+    decoder = VINdecoder %>% select(-`VIN Model Year`, -`VIN Prefix`) %>% distinct(`Vehicle Name`, .keep_all = TRUE)
+    df_zips <- df %>%
+      left_join(decoder, b = c("Vehicle Name" = "Vehicle Name")) %>%
+      group_by(`ZIP Code`, Technology) %>%
+      summarize(Count = n(), .groups = "keep") %>%
+      ungroup() %>%
+      rename(Zip_Code = `ZIP Code`)
+  } else if (file == "wa_ev_registrations_public.csv"){
+    decoder = VINdecoder %>% select(-`VIN Model Year`, -`Vehicle Name`) %>% distinct(`VIN Prefix`, .keep_all = TRUE)
+    df_zips <- df %>%
+      left_join(decoder, b = c("VIN Prefix" = "VIN Prefix")) %>%
+      group_by(`ZIP Code`, Technology) %>%
+      summarize(Count = n(), .groups = "keep") %>%
+      ungroup() %>%
+      rename(Zip_Code = `ZIP Code`)
+  } else {
+    df_zips <- df %>%
+      left_join(VINdecoder, b = c("VIN Prefix" = "VIN Prefix", "VIN Model Year" = "VIN Model Year")) %>%
+      group_by(`ZIP Code`, Technology) %>%
+      summarize(Count = n(), .groups = "keep") %>%
+      ungroup() %>%
+      rename(Zip_Code = `ZIP Code`)
+  }
+  sum(df_zips$Count)
+  EV_regs_zip = EV_regs_zip %>% rbind(df_zips) #update master with new zip code values
+}
+
+#restore leading 0's in zip codes
+EV_regs_zip = EV_regs_zip %>%
+  mutate(Zip_Code = ifelse(nchar(Zip_Code) < 5, paste0(0, Zip_Code), Zip_Code)) %>%
+  mutate(Zip_Code = ifelse(nchar(Zip_Code) < 5, paste0(0, Zip_Code), Zip_Code)) # again for double 0
+
+EV_regs_zip_raw = EV_regs_zip
+```
+
+Now with ZIP code level data, we can join median household income to the same dataframe, and then create a weighted average bar graph. Get variables from data.census.gov and https://api.census.gov/data/2019/acs/acs5/subject/variables.html, retrieve using `tidycensus`. 
+
+```{r}
+EV_regs_zip = EV_regs_zip_raw
+#Retrieve Census ZIP Code data
+zip_pop <- get_acs(
+  geography = "zcta",
+  variables = c("B01003_001E"), #population
+  state = c("Colorado", "Connecticut", "Maryland", "Michigan", "Minnesota", "New Jersey", "New York", "Oregon", "Texas", "Vermont", "Washington", "Wisconsin"),
+  year = 2019,
+  geometry = FALSE
+)
+zip_pop <- zip_pop %>% select(Zip_Code = GEOID, Pop = estimate)
+
+zip_income <- get_acs(
+  geography = "zcta",
+  variables = c("S2503_C01_013E"), #median household income in past 12 months, 2019 inflation adjusted
+  state = c("Colorado", "Connecticut", "Maryland", "Michigan", "Minnesota", "New Jersey", "New York", "Oregon", "Texas", "Vermont", "Washington", "Wisconsin"),
+  year = 2019,
+  geometry = FALSE
+)
+zip_data <- zip_income %>% select(Zip_Code = GEOID, Income = estimate) %>% left_join(zip_pop, by = "Zip_Code")
+
+#Inner join excludes non-mateched zip codes (insufficient data or just bad data entry)
+EV_regs_zip <- EV_regs_zip %>% inner_join(zip_data, by = "Zip_Code")
+write_csv(EV_regs_zip, "all_states_zip_EV_registrations.csv")
+
+#check if small zip codes are indeed small --> yes!
+#baddata <- EV_regs_zip[is.na(EV_regs_zip$Income) | is.na(EV_regs_zip$Pop),]
+#sum(baddata$Count)
+
+```
+
+Now, the grand finale--plotting to a stacked bar chart via `ggplot`, with the population distribution for comparison in the background. As noted, the bump of EV sales is shifted more to the right than the general population. This is also inherently conservative, since, we're using ZIP code median income instead of individual incomes. 
+
+```{r}
+#First get EV ownership into percentiles and income categories
+EV_regs_zip_bar <- EV_regs_zip %>%
+  mutate(Inc_cat = case_when(
+    Income <=25000 ~ "<$25,000",
+    Income >25000 & Income<= 50000 ~ "$25,000 - $50,000",
+    Income >50000 & Income<= 75000 ~ "$50,000 - $75,000",
+    Income >75000 & Income<= 150000 ~ "$75,000 - $150,000",
+    Income >150000 ~ ">$150,000"
+  )) %>%
+  group_by(Inc_cat, Technology) %>%
+  summarise(Total = sum(Count), .groups = "keep") %>%
+  mutate(Total = 100*Total/sum(EV_regs_zip$Count)) %>%
+  filter(Technology != "FCV") %>%
+  na.omit()
+
+EV_regs_zip_bar$Inc_cat <- factor(EV_regs_zip_bar$Inc_cat,
+                                  levels = c("<$25,000", "$25,000 - $50,000", "$50,000 - $75,000", "$75,000 - $150,000", ">$150,000"))
+EV_regs_zip_bar$Technology <- factor(EV_regs_zip_bar$Technology,
+                                  levels = c("BEV", "PHEV"))
+
+#Deal with population data separately
+pop_data <- EV_regs_zip %>%
+  mutate(Inc_cat = case_when(
+    Income <=25000 ~ "<$25,000",
+    Income >25000 & Income<= 50000 ~ "$25,000 - $50,000",
+    Income >50000 & Income<= 75000 ~ "$50,000 - $75,000",
+    Income >75000 & Income<= 150000 ~ "$75,000 - $150,000",
+    Income >150000 ~ ">$150,000"
+  )) %>%
+  distinct(Zip_Code, .keep_all=TRUE) %>% 
+  group_by(Inc_cat) %>%
+  summarise(TotalPop = sum(Pop), .groups = "keep") %>%
+  na.omit()
+#Normalize by total population in ZIP codes of interest
+sumPop = sum(pop_data$TotalPop)
+pop_data <- pop_data %>%
+  mutate(TotalPop = 100*TotalPop/sumPop)
+#factor for graphing
+pop_data$Inc_cat <- factor(pop_data$Inc_cat,
+                                  levels = c("<$25,000", "$25,000 - $50,000", "$50,000 - $75,000", "$75,000 - $150,000", ">$150,000"))
+
+finalplot =EV_regs_zip_bar %>% ggplot() + 
+  geom_bar(data = EV_regs_zip_bar, aes(fill=Technology, y=Total, x=Inc_cat), position=position_stack(reverse = TRUE), stat = "identity") + 
+  geom_line(data=pop_data, aes(x=Inc_cat, y = TotalPop, group = 1, lty='Income Distribution\nBy Population'), size = 1, col = "black") + 
+  scale_linetype(name = NULL) +
+  scale_x_discrete(guide = guide_axis(n.dodge = 2)) +
+  theme_minimal() + 
+  xlab("ZIP Code Median Household Income") + 
+  ylab("Percentage") +
+  theme(panel.grid.major.x = element_blank(),
+        axis.title.x = element_text(face="bold"),
+        axis.title.y = element_text(face="bold"))
+  
+ggsave("EV Registrations Distribution.png", 
+       width = 7,
+       height = 3.5)
+
+```
+
+Future work could include an interactive D3 graph in the blog, a mapping tool for this inequality (since this is based on spatial data), or just being more robust by contacting DMV's in more states to fill out the data. Fun exercise!
+
